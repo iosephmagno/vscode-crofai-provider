@@ -1,6 +1,14 @@
+
 import * as vscode from 'vscode';
 
+// Simple flag to enable/disable logging
+export let LOGGING_ENABLED = false;
+export function setLoggingEnabled(enabled: boolean) {
+  LOGGING_ENABLED = enabled;
+}
+
 let outputChannel: vscode.LogOutputChannel | undefined;
+
 
 export function getOutputChannel(): vscode.LogOutputChannel {
   if (!outputChannel) {
@@ -14,19 +22,27 @@ export function disposeOutputChannel(): void {
   outputChannel = undefined;
 }
 
+
 export function logInfo(message: string, ...args: unknown[]): void {
+  if (!LOGGING_ENABLED) return;
   getOutputChannel().info(message, ...args);
 }
 
+
 export function logWarn(message: string, ...args: unknown[]): void {
+  if (!LOGGING_ENABLED) return;
   getOutputChannel().warn(message, ...args);
 }
 
+
 export function logError(message: string, ...args: unknown[]): void {
+  if (!LOGGING_ENABLED) return;
   getOutputChannel().error(message, ...args);
 }
 
+
 export function logDebug(message: string, ...args: unknown[]): void {
+  if (!LOGGING_ENABLED) return;
   getOutputChannel().debug(message, ...args);
 }
 
