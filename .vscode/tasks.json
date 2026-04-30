@@ -1,0 +1,34 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "npm",
+			"script": "watch",
+			"problemMatcher": "$tsc-watch",
+			"isBackground": true,
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		},
+		{
+			"type": "npm",
+			"script": "compile",
+			"problemMatcher": "$tsc",
+			"group": "build"
+		},
+		{
+			"label": "Run CrofAI session tester",
+			"type": "shell",
+			"command": "node",
+			"args": [
+				"/Users/iosemagno/Development/crofai-extension/vscode-crofai-provider/tools/session-tester.mjs",
+				"--env-file",
+				"/Users/iosemagno/Development/dart_native_framework/.env",
+				"--model",
+				"deepseek-v4-pro-precision"
+			],
+			"isBackground": false
+		}
+	]
+}

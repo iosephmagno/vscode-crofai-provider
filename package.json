@@ -1,0 +1,175 @@
+{
+  "name": "crof-ai-provider",
+  "publisher": "m1n",
+  "displayName": "CrofAI Provider for GitHub Copilot",
+  "description": "Community extension. Use CrofAI's open-weight models with GitHub Copilot in VS Code.",
+  "version": "1.0.1",
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "enabledApiProposals": [
+    "languageModelThinkingPart",
+    "languageModelDataPart"
+  ],
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "galleryBanner": {
+    "color": "#100f11",
+    "theme": "dark"
+  },
+  "homepage": "https://crof.ai",
+  "license": "EUPL-1.2",
+  "icon": "assets/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/M1n-74316D65/vscode-crofai-provider"
+  },
+  "contributes": {
+    "walkthroughs": [
+      {
+        "id": "crofai.setup",
+        "title": "Get started with CrofAI",
+        "description": "Connect CrofAI's open-weight models to GitHub Copilot Chat in a few steps.",
+        "steps": [
+          {
+            "id": "crofai.setup.getKey",
+            "title": "Get your CrofAI API key",
+            "description": "Sign up at [crof.ai](https://crof.ai) and copy your API key from the dashboard.\n\nFree models are available — no credit card required.",
+            "media": {
+              "markdown": "assets/walkthrough/get-key.md"
+            }
+          },
+          {
+            "id": "crofai.setup.setKey",
+            "title": "Enter your API key",
+            "description": "Run the command below to securely store your API key.\n\n[Set API Key](command:crofai.manage)",
+            "media": {
+              "markdown": "assets/walkthrough/set-key.md"
+            },
+            "completionEvents": [
+              "onCommand:crofai.manage"
+            ]
+          },
+          {
+            "id": "crofai.setup.pickModel",
+            "title": "Pick a CrofAI model in Copilot Chat",
+            "description": "Open Copilot Chat, click the model picker, and choose any **CrofAI** model.\n\nReasoning models show an effort selector (No Thinking / Low / Medium / High) directly in the picker.\n\n[Open Copilot Chat](command:workbench.panel.chat.view.copilot.focus)",
+            "media": {
+              "markdown": "assets/walkthrough/pick-model.md"
+            }
+          },
+          {
+            "id": "crofai.setup.done",
+            "title": "You're ready",
+            "description": "Your credits and daily request quota are shown in the status bar.\n\nClick the status bar item or run **CrofAI: Show Usage** anytime.\n\n[Show Usage](command:crofai.showUsage)",
+            "media": {
+              "markdown": "assets/walkthrough/done.md"
+            }
+          }
+        ]
+      }
+    ],
+    "languageModelChatProviders": [
+      {
+        "vendor": "crofai",
+        "displayName": "CrofAI",
+        "managementCommand": "crofai.manage"
+      }
+    ],
+    "commands": [
+      {
+        "command": "crofai.manage",
+        "title": "Manage CrofAI Provider",
+        "category": "CrofAI"
+      },
+      {
+        "command": "crofai.showUsage",
+        "title": "Show Usage",
+        "category": "CrofAI"
+      },
+      {
+        "command": "crofai.configureTemperature",
+        "title": "Configure Model Temperature",
+        "category": "CrofAI"
+      },
+      {
+        "command": "crofai.configureReasoning",
+        "title": "Configure Reasoning Effort",
+        "category": "CrofAI"
+      },
+      {
+        "command": "crofai.refreshModels",
+        "title": "Refresh Models",
+        "category": "CrofAI"
+      }
+    ],
+    "configuration": {
+      "title": "CrofAI Provider",
+      "properties": {
+        "crofai.modelTemperatures": {
+          "type": "object",
+          "default": {},
+          "description": "Custom temperature values for each model. Keys are model IDs, values are temperature numbers between 0 and 2."
+        },
+        "crofai.modelReasoningEfforts": {
+          "type": "object",
+          "default": {},
+          "description": "Custom reasoning effort for each model. Keys are model IDs, values are 'none', 'low', 'medium', or 'high'."
+        },
+        "crofai.requestTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 10000,
+          "maximum": 600000,
+          "description": "Request timeout in milliseconds for model responses. Increase this for long reasoning models."
+        }
+      }
+    }
+  },
+  "activationEvents": [
+    "onLanguageModelChat:crofai",
+    "onCommand:crofai.manage",
+    "onCommand:crofai.showUsage",
+    "onCommand:crofai.configureTemperature",
+    "onCommand:crofai.configureReasoning",
+    "onCommand:crofai.refreshModels",
+    "onWalkthrough:crofai.setup"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --production",
+    "compile": "node esbuild.js",
+    "compile:tsc": "bunx tsc -p ./ --noEmit",
+    "lint": "bunx eslint",
+    "format": "bunx prettier --write .",
+    "watch": "node esbuild.js --watch",
+    "test": "node esbuild.js && vscode-test",
+    "package": "vsce package --out crof-ai-provider.vsix",
+    "test:session": "node ./tools/session-tester.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.13.0",
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^22.19.17",
+    "@types/vscode": "^1.105.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.2",
+    "@typescript-eslint/parser": "^8.58.2",
+    "@vscode/dts": "^0.4.1",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.2.2",
+    "esbuild": "^0.28.0",
+    "eslint": "^9.13.0",
+    "prettier": "^3.1.0",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.58.2"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1038.0",
+    "radash": "^12.1.1",
+    "zod": "^3.23.8"
+  }
+}

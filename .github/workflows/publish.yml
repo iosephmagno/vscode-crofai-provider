@@ -1,0 +1,21 @@
+name: Publish to VS Code Marketplace
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run compile
+
+      - name: Publish extension
+        run: bunx vsce publish --allow-proposed-apis languageModelThinkingPart -p ${{ secrets.VSCE_PAT }}
