@@ -13,6 +13,20 @@ import { logInfo, logWarn, logError, logDebug, logRequestStart, logRequestEnd, l
 import { logPayloadToFile } from './fileLogger.js';
 import { imageServer } from './imageServer.js';
 
+// Type guards for VS Code chat parts
+function isToolCallPart(p: unknown): p is vscode.LanguageModelToolCallPart {
+  return !!p && typeof p === 'object' && 'callId' in p && 'name' in p;
+}
+function isToolResultPart(p: unknown): p is vscode.LanguageModelToolResultPart {
+  return !!p && typeof p === 'object' && 'callId' in p && 'content' in p;
+}
+function isTextPart(p: unknown): p is vscode.LanguageModelTextPart {
+  return !!p && typeof p === 'object' && 'value' in p && typeof (p as { value: unknown }).value === 'string';
+}
+function isDataPart(p: unknown): p is vscode.LanguageModelDataPart {
+  return !!p && typeof p === 'object' && 'mimeType' in p && 'data' in p;
+}
+
 const MAX_RETRIES = 2; // Only for real errors (network / 5xx) — NOT for empty streams
 const RETRY_BASE_DELAY_MS = 500;
 const RETRY_JITTER_FACTOR = 0.2;
@@ -324,26 +338,55 @@ async function buildOpenAIMessages(messages: readonly vscode.LanguageModelChatRe
     tool_calls?: unknown[];
   }> = [];
 
-  for (const msg of messages) {
-    const role = msg.role === 1 ? 'user' : msg.role === 2 ? 'assistant' : 'system';
-
-    const toolCallParts = msg.content.filter(
-      (p): p is vscode.LanguageModelToolCallPart => p instanceof vscode.LanguageModelToolCallPart
-    );
-    const toolResultParts = msg.content.filter(
-      (p): p is vscode.LanguageModelToolResultPart => p instanceof vscode.LanguageModelToolResultPart
-    );
-    const textParts = msg.content.filter(
-      (p): p is vscode.LanguageModelTextPart => p instanceof vscode.LanguageModelTextPart
-    );
+  // Identify the last 10 messages and the latest 2 vision prompts among them
+  const last10 = messages.slice(-10);
+  // Find indices (relative to last10) of vision prompts (messages with image/* data parts)
+  const visionIndices: number[] = [];
+  last10.forEach((msg, idx) => {
     const dataParts = msg.content.filter(
       (p): p is vscode.LanguageModelDataPart => p instanceof vscode.LanguageModelDataPart
     );
+    if (dataParts.some((p) => p.mimeType.startsWith('image/'))) {
+      visionIndices.push(idx);
+    }
+  });
+  // Only keep the last 2 vision prompt indices
+  const keepVisionIndices = new Set(visionIndices.slice(-2));
+
+  // For each message, determine if its images should be included
+  // Map: message index in messages -> includeImages (true/false)
+  const includeImagesMap = new Map<number, boolean>();
+  messages.forEach((msg, i) => {
+    // If this message is in the last 10, and is one of the last 2 vision prompts, include images
+    const last10Idx = i - (messages.length - last10.length);
+    if (last10Idx >= 0 && keepVisionIndices.has(last10Idx)) {
+      includeImagesMap.set(i, true);
+    } else {
+      includeImagesMap.set(i, false);
+    }
+  });
+
+  for (let i = 0; i < messages.length; ++i) {
+    const msg = messages[i];
+    const role = msg.role === 1 ? 'user' : msg.role === 2 ? 'assistant' : 'system';
+
+    const toolCallParts = msg.content.filter(isToolCallPart);
+    const toolResultParts = msg.content.filter(isToolResultPart);
+    const textParts = msg.content.filter(isTextPart);
+    const dataParts = msg.content.filter(isDataPart);
 
     // Log message parts breakdown
     logDebug(`[buildMessages] role=${role} textParts=${textParts.length} dataParts=${dataParts.length} toolCalls=${toolCallParts.length} toolResults=${toolResultParts.length} name=${msg.name ?? '(none)'}`);
     for (const dp of dataParts) {
-      logDebug(`[buildMessages]   dataPart mimeType=${dp.mimeType} dataSize=${('byteLength' in dp.data ? (dp.data as Uint8Array).byteLength : dp.data instanceof ArrayBuffer ? dp.data.byteLength : typeof dp.data === 'object' && 'length' in dp.data ? (dp.data as { length: number }).length : '?')}`);
+      let dataSize: number | string = '?';
+      if (dp.data && typeof dp.data === 'object') {
+        if ('byteLength' in dp.data && typeof (dp.data as any).byteLength === 'number') {
+          dataSize = (dp.data as { byteLength: number }).byteLength;
+        } else if ('length' in dp.data && typeof (dp.data as any).length === 'number') {
+          dataSize = (dp.data as { length: number }).length;
+        }
+      }
+      logDebug(`[buildMessages]   dataPart mimeType=${dp.mimeType} dataSize=${dataSize}`);
     }
 
     // Tool call messages
@@ -383,26 +426,45 @@ async function buildOpenAIMessages(messages: readonly vscode.LanguageModelChatRe
 
     // Images present → use array format (OpenAI vision API)
     const imageParts = dataParts.filter((p) => p.mimeType.startsWith('image/'));
+    const includeImages = includeImagesMap.get(i) ?? false;
     if (imageParts.length > 0) {
-      logInfo(`[buildMessages] Images detected: ${imageParts.length} image(s), ${textParts.length} text part(s)`);
-      const content: Array<unknown> = [];
-      const textValue = textParts.map((p) => p.value).join('');
-      if (textValue) {
-        logDebug(`[buildMessages]   text content: "${textValue.substring(0, 200)}"`);
-        content.push({ type: 'text', text: textValue });
+      if (includeImages) {
+        logInfo(`[buildMessages] Images detected: ${imageParts.length} image(s), ${textParts.length} text part(s)`);
+        const content: Array<unknown> = [];
+        const textValue = textParts.map((p) => p.value).join('');
+        if (textValue) {
+          logDebug(`[buildMessages]   text content: "${textValue.substring(0, 200)}"`);
+          content.push({ type: 'text', text: textValue });
+        }
+        for (const part of imageParts) {
+          // If part.data is a string and looks like a public URL, use it directly
+          let url: string | undefined;
+          if (typeof part.data === 'string' && /^https?:\/\//.test(part.data)) {
+            url = part.data;
+            logInfo(`[buildMessages] Using existing image URL: ${url}`);
+          } else {
+            logInfo(`[buildMessages] Uploading image mimeType=${part.mimeType} size=${('byteLength' in part.data ? (part.data as Uint8Array).byteLength : '?')}`);
+            url = await imageServer.upload(Buffer.from(part.data), part.mimeType);
+            logInfo(`[buildMessages] Image uploaded url=${url}`);
+          }
+          content.push({ type: 'image_url', image_url: { url } });
+        }
+        const contentSummary = content.map((c: unknown) => {
+          const entry = c as { type: string; text?: string; image_url?: { url: string } };
+          return entry.type === 'text' ? `text:${(entry.text?.substring(0, 50) ?? '')}` : `image:${(entry.image_url?.url?.substring(0, 80) ?? '')}`;
+        }).join(' | ');
+        logInfo(`[buildMessages] Pushed image message role=${role} content=[${contentSummary}]`);
+        result.push({ role, content, name: msg.name });
+      } else {
+        // Skip images, but include text if present
+        const textValue = textParts.map((p) => p.value).join('');
+        if (textValue) {
+          logInfo(`[buildMessages] Skipping images for message (not in latest 2 vision prompts in last 10). Including text only.`);
+          result.push({ role, content: textValue, name: msg.name });
+        } else {
+          logInfo(`[buildMessages] Skipping entire vision message (no text, not in latest 2 vision prompts in last 10).`);
+        }
       }
-      for (const part of imageParts) {
-        logInfo(`[buildMessages] Uploading image mimeType=${part.mimeType} size=${('byteLength' in part.data ? (part.data as Uint8Array).byteLength : '?')}`);
-        const url = await imageServer.upload(Buffer.from(part.data), part.mimeType);
-        logInfo(`[buildMessages] Image uploaded url=${url}`);
-        content.push({ type: 'image_url', image_url: { url } });
-      }
-      const contentSummary = content.map((c: unknown) => {
-        const entry = c as { type: string; text?: string; image_url?: { url: string } };
-        return entry.type === 'text' ? `text:${(entry.text?.substring(0, 50) ?? '')}` : `image:${(entry.image_url?.url?.substring(0, 80) ?? '')}`;
-      }).join(' | ');
-      logInfo(`[buildMessages] Pushed image message role=${role} content=[${contentSummary}]`);
-      result.push({ role, content, name: msg.name });
       continue;
     }
 

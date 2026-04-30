@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "./out",
@@ -16,7 +16,8 @@
     "resolveJsonModule": true,
     "declaration": true,
     "declarationMap": true,
-    "incremental": true
+    "incremental": true,
+    "types": ["node"]
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "out", "**/*.test.ts"]
