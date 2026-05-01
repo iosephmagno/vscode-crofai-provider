@@ -132,23 +132,22 @@ function emitChunkToProgress(
   toolCallBuffer: Map<number, { id: string; name: string; arguments: string }>,
   dynamicReasoningAsText?: { value: boolean }
 ): boolean {
-  // Consider usage/choices as a valid non-empty signal even before text arrives.
-  let gotContent = !!(chunk.usage || Array.isArray(chunk.choices));
+  // Return whether this chunk produced at least one emitted response part.
+  let emittedPart = false;
 
   const choice = chunk.choices?.[0];
-  if (!choice) return gotContent;
+  if (!choice) return emittedPart;
 
   const delta = choice.delta ?? {};
 
   // Reasoning is handled by the streaming loop buffer — skip it here to avoid double emission
   const reasoningText = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
   if (reasoningText != null) {
-    gotContent = true;
-    return gotContent;
+    return emittedPart;
   }
 
   if (delta.content != null) {
-    gotContent = true;
+    emittedPart = true;
     const text = typeof delta.content === 'string' ? delta.content : JSON.stringify(delta.content);
     progress.report(new vscode.LanguageModelTextPart(text));
   }
@@ -171,25 +170,16 @@ function emitChunkToProgress(
     }
   }
 
-  if (choice.finish_reason && choice.finish_reason !== 'tool_calls') {
-    gotContent = true;
-  }
-
   if (choice.finish_reason === 'tool_calls') {
-    gotContent = true;
     for (const [, tc] of toolCallBuffer) {
-      let args: object = {};
-      try {
-        args = JSON.parse(tc.arguments || '{}');
-      } catch {
-        // Keep empty object
-      }
+      const args = parseToolArgumentsOrThrow(tc.arguments, tc.name, 'stream');
+      emittedPart = true;
       progress.report(new vscode.LanguageModelToolCallPart(tc.id, tc.name, args));
     }
     toolCallBuffer.clear();
   }
 
-  return gotContent;
+  return emittedPart;
 }
 
 function chunkHasAnyPayload(chunk: ChunkData): boolean {
@@ -211,6 +201,27 @@ function chunkHasAnyPayload(chunk: ChunkData): boolean {
     !!delta.tool_calls?.length ||
     choice.finish_reason != null
   );
+}
+
+function parseToolArgumentsOrThrow(rawArgs: string | undefined, toolName: string, source: string): object {
+  const input = rawArgs?.trim() || '{}';
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    const preview = input.slice(0, 200);
+    throw new Error(`Malformed tool call arguments from ${source} for tool "${toolName}": ${preview}`);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const kind = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
+    throw new Error(
+      `Malformed tool call arguments from ${source} for tool "${toolName}": expected JSON object, got ${kind}`
+    );
+  }
+
+  return parsed as object;
 }
 
 function emitNonStreamingCompletion(
@@ -242,16 +253,15 @@ function emitNonStreamingCompletion(
     logDebug(`[emitNonStreaming] contentLen=${message.content?.length ?? 0} reasoning=${!!(message.reasoning_content ?? message.reasoning ?? message.thinking)} toolCalls=${message.tool_calls?.length ?? 0}`);
   }
   if (!message) {
-    const ret = !!(data.choices?.[0]?.finish_reason || data.usage || Array.isArray(data.choices));
-    logDebug(`[emitNonStreaming] No message, returning gotContent=${ret}`);
-    return ret;
+    logDebug('[emitNonStreaming] No message, returning emitted=false');
+    return false;
   }
 
-  let gotContent = !!(data.choices?.[0]?.finish_reason || data.usage);
+  let emittedPart = false;
 
   const reasoningText = message.reasoning_content ?? message.reasoning ?? message.thinking;
   if (reasoningText != null) {
-    gotContent = true;
+    emittedPart = true;
     const text = String(reasoningText);
     if (shouldShowThinking) {
       const thinkingPart = new vscode.LanguageModelThinkingPart(text);
@@ -262,28 +272,23 @@ function emitNonStreamingCompletion(
   }
 
   if (message.content != null && message.content !== '') {
-    gotContent = true;
+    emittedPart = true;
     const text = typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
     progress.report(new vscode.LanguageModelTextPart(text));
   }
 
   if (message.tool_calls && message.tool_calls.length > 0) {
-    gotContent = true;
+    emittedPart = true;
     for (const tc of message.tool_calls) {
       const callId = tc.id || `tool_${Math.random().toString(36).slice(2)}`;
       const name = tc.function?.name || 'tool_call';
-      let args: object = {};
-      try {
-        args = JSON.parse(tc.function?.arguments || '{}');
-      } catch {
-        // Keep empty object
-      }
+      const args = parseToolArgumentsOrThrow(tc.function?.arguments, name, 'non-stream');
       progress.report(new vscode.LanguageModelToolCallPart(callId, name, args));
     }
   }
 
-  logDebug(`[emitNonStreaming] Returning gotContent=${gotContent}`);
-  return gotContent;
+  logDebug(`[emitNonStreaming] Returning emitted=${emittedPart}`);
+  return emittedPart;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -319,6 +324,9 @@ function resolveErrorMessage(error: unknown): string {
   }
   if (msg.includes('Connection timeout') || msg.includes('Idle timeout')) {
     return `CrofAI request timed out: ${msg}.`;
+  }
+  if (msg.includes('Malformed tool call arguments')) {
+    return `CrofAI returned malformed tool-call arguments: ${msg}`;
   }
   return `CrofAI error: ${msg}`;
 }
@@ -555,7 +563,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
       const cancelDisposable = token.onCancellationRequested(() => abortController.abort());
       const startMs = Date.now();
       let ttfMs: number | undefined;
-      let gotContent = false;
+      let emittedAnyPart = false;
 
       // Connection timeout: fires if no bytes arrive within CONNECTION_TIMEOUT_MS.
       // Idle timeout: fires if no new chunk arrives within IDLE_TIMEOUT_MS after streaming starts.
@@ -653,8 +661,8 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
           const payload = await response.json();
           logPayloadToFile('response', { type: 'non-streaming', model: baseModelId, payload });
           logDebug(`[NonStreaming] payload=${JSON.stringify(payload).substring(0, 1000)}`);
-          gotContent = emitNonStreamingCompletion(payload, progress, shouldShowThinking);
-          logInfo(`[NonStreaming] emitNonStreamingCompletion returned gotContent=${gotContent}`);
+          emittedAnyPart = emitNonStreamingCompletion(payload, progress, shouldShowThinking);
+          logInfo(`[NonStreaming] emitNonStreamingCompletion returned emitted=${emittedAnyPart}`);
           logRequestEnd({
             model: baseModelId,
             ttfms: Date.now() - startMs,
@@ -664,7 +672,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
             retries,
           });
 
-          if (!gotContent) {
+          if (!emittedAnyPart) {
             logWarn(`[NonStreaming] Empty response payload: ${JSON.stringify(payload).substring(0, 500)}`);
             throw new Error('Empty non-streaming response from CrofAI');
           }
@@ -685,7 +693,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
         let reasoningBuffer = '';
         const flushReasoning = () => {
           if (!reasoningBuffer) return;
-          gotContent = true;
+          emittedAnyPart = true;
           if (shouldShowThinking) {
             const thinkingPart = new vscode.LanguageModelThinkingPart(reasoningBuffer);
             progress.report(thinkingPart as unknown as vscode.LanguageModelResponsePart);
@@ -703,7 +711,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
 
           const { done, value } = await reader.read();
           if (done) {
-            logInfo(`[Stream] done totalBytes=${totalBytesReceived} gotContent=${gotContent}`);
+            logInfo(`[Stream] done totalBytes=${totalBytesReceived} emittedAnyPart=${emittedAnyPart}`);
             // Log the raw stream to file for debugging
             logPayloadToFile('response', { type: 'stream', model: baseModelId, totalBytes: totalBytesReceived, rawData: rawStreamText.substring(0, 100_000) });
             break;
@@ -775,7 +783,6 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
             // Also switch from connection timeout to idle timeout on first chunk.
             if (chunkHasAnyPayload(chunk)) {
               if (ttfMs === undefined) ttfMs = Date.now() - startMs;
-              gotContent = true;
             }
             // Reset idle timeout on every valid chunk so long responses don't get cut off.
             resetIdleTimeout();
@@ -809,7 +816,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
               );
               if (hadContent) {
                 if (ttfMs === undefined) ttfMs = Date.now() - startMs;
-                gotContent = true;
+                emittedAnyPart = true;
                 logDebug('[SSE] Content emitted to progress');
               }
             } catch (emitErr) {
@@ -839,7 +846,6 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
               const chunk: ChunkData = parsed;
               if (chunkHasAnyPayload(chunk)) {
                 if (ttfMs === undefined) ttfMs = Date.now() - startMs;
-                gotContent = true;
               }
               try {
                 const hadContent = emitChunkToProgress(
@@ -851,7 +857,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
                 );
                 if (hadContent) {
                   if (ttfMs === undefined) ttfMs = Date.now() - startMs;
-                  gotContent = true;
+                  emittedAnyPart = true;
                 }
               } catch (emitErr) {
                 logWarn(
@@ -868,13 +874,8 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
 
         // Emit any remaining buffered tool calls
         for (const [, tc] of toolCallBuffer) {
-          let args: object = {};
-          try {
-            args = JSON.parse(tc.arguments || '{}');
-          } catch {
-            // Keep empty object
-          }
-          gotContent = true;
+          const args = parseToolArgumentsOrThrow(tc.arguments, tc.name, 'stream-trailing');
+          emittedAnyPart = true;
           progress.report(new vscode.LanguageModelToolCallPart(tc.id, tc.name, args));
         }
 
@@ -889,7 +890,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
 
         // Retry on empty stream; if this is the last attempt, throw a real
         // error so VS Code doesn't display a generic "no response returned".
-        if (!gotContent) {
+        if (!emittedAnyPart) {
           logWarn(`[EmptyStream] model=${baseModelId} totalChars=${totalMessageChars} roles=[${roleSequence}]`);
           logError(`[EmptyStream] No recovery possible for model=${baseModelId}`);
           // Log what the raw stream contained (if anything) for debugging
@@ -902,7 +903,8 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         const errorStack = error instanceof Error ? error.stack : undefined;
-        logError(`[Catch] model=${baseModelId} attempt=${retries}/${MAX_RETRIES} gotContent=${gotContent} error=${errorMsg} stack=${errorStack ?? '(no stack)'}`);
+        const isMalformedToolCallError = errorMsg.includes('Malformed tool call arguments');
+        logError(`[Catch] model=${baseModelId} attempt=${retries}/${MAX_RETRIES} emittedAnyPart=${emittedAnyPart} error=${errorMsg} stack=${errorStack ?? '(no stack)'}`);
 
         if (isAbortError(error)) {
           // User cancelled — not an error
@@ -911,7 +913,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
 
         // If we already emitted content, preserve the partial answer instead of
         // converting it into a hard failure due to a late stream/provider error.
-        if (gotContent) {
+        if (emittedAnyPart && !isMalformedToolCallError) {
           logWarn(
             `[Stream] model=${baseModelId} ended with partial content: ${errorMsg}`
           );
@@ -928,6 +930,11 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
 
         // Don't retry auth errors
         if (errorMsg.includes('401') || errorMsg.includes('403')) {
+          break;
+        }
+
+        // Malformed tool call arguments are payload issues and retries won't help.
+        if (isMalformedToolCallError) {
           break;
         }
 
