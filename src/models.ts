@@ -25,6 +25,8 @@ const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
 /** Schema placed on each reasoning-capable model. The group:'navigation' property
  *  makes VS Code render the effort picker as a button directly in the model picker. */
 const REASONING_CONFIGURATION_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
   properties: {
     reasoningEffort: {
       type: 'string',
@@ -71,15 +73,14 @@ function getModelFamily(modelId: string): string {
   return 'crofai';
 }
 
-/** Backwards-compat: strip #low/#medium/#high suffix from model IDs
- *  that may still be persisted from the old 4-variant approach. */
+/** Strip effort suffix from model IDs (#none, #low, #medium, #high). */
 export function getEffortFromModelId(modelId: string): {
   baseModelId: string;
   effort: ReasoningEffort | undefined;
 } {
   for (const effort of REASONING_EFFORTS) {
     const suffix = `#${effort}`;
-    if (effort !== 'none' && modelId.endsWith(suffix)) {
+    if (modelId.endsWith(suffix)) {
       return {
         baseModelId: modelId.slice(0, -suffix.length),
         effort,
@@ -262,23 +263,47 @@ export class CrofAIModelsService {
       if (model.quantization) tooltipParts.push(model.quantization);
       if (model.speed !== undefined) tooltipParts.push(`Speed ${model.speed}`);
 
-      result.push({
-        id: model.id,
-        name: modelName,
-        tooltip: tooltipParts.join(' • '),
-        family,
-        detail: detailParts.join(' • '),
-        version: '1.0.0',
-        maxInputTokens: contextLength,
-        maxOutputTokens: 0,
-        capabilities: {
-          toolCalling: true,
-          imageInput: supportsVision,
-        },
-        isUserSelectable: true,
-        category: { label: 'CrofAI', order: 2 },
-        ...(supportsThinking ? { configurationSchema: REASONING_CONFIGURATION_SCHEMA } : {}),
-      } satisfies LanguageModelChatInformation);
+      if (supportsThinking) {
+        // Register one entry per reasoning effort level so users can choose directly from the model picker.
+        for (const effort of REASONING_EFFORTS) {
+          const variantId = `${model.id}#${effort}`;
+          const effortLabel = REASONING_EFFORT_LABELS[effort];
+          const variantName = `${modelName} (${effortLabel})`;
+          result.push({
+            id: variantId,
+            name: variantName,
+            tooltip: [...tooltipParts, effortLabel].join(' • '),
+            family,
+            detail: detailParts.join(' • '),
+            version: '1.0.0',
+            maxInputTokens: contextLength,
+            maxOutputTokens: 0,
+            capabilities: {
+              toolCalling: true,
+              imageInput: true, // all models support file attachment via Litterbox upload
+            },
+            isUserSelectable: true,
+            category: { label: 'CrofAI', order: 2 },
+          } satisfies LanguageModelChatInformation);
+        }
+      } else {
+        result.push({
+          id: model.id,
+          name: modelName,
+          tooltip: tooltipParts.join(' • '),
+          family,
+          detail: detailParts.join(' • '),
+          version: '1.0.0',
+          maxInputTokens: contextLength,
+          maxOutputTokens: 0,
+          capabilities: {
+            toolCalling: true,
+          imageInput: true, // all models support file attachment via Litterbox upload
+          },
+          isUserSelectable: true,
+          category: { label: 'CrofAI', order: 2 },
+        } satisfies LanguageModelChatInformation);
+      }
     }
 
     return result;

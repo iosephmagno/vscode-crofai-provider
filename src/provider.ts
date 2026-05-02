@@ -34,6 +34,8 @@ const RETRY_JITTER_FACTOR = 0.2;
 const CONNECTION_TIMEOUT_MS = 90_000;
 // Max time between successive SSE chunks once streaming has started (idle timeout).
 const IDLE_TIMEOUT_MS = 120_000;
+const MAX_CONTEXT_MESSAGES = 40;
+const MAX_CONTEXT_CHARS = 120_000;
 
 const VALID_REASONING_EFFORTS = new Set<string>(['none', 'low', 'medium', 'high']);
 
@@ -72,6 +74,153 @@ interface ChunkData {
 interface SseEvent {
   event?: string;
   data: string;
+}
+
+type OpenAIRequestMessage = {
+  role: string;
+  content: string | Array<unknown>;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: unknown[];
+};
+
+function messageContentLength(content: string | Array<unknown>): number {
+  if (typeof content === 'string') {
+    return content.length;
+  }
+
+  try {
+    return JSON.stringify(content).length;
+  } catch {
+    return 0;
+  }
+}
+
+function truncateOpenAIMessages(openaiMessages: OpenAIRequestMessage[], modelId: string): OpenAIRequestMessage[] {
+  if (openaiMessages.length <= MAX_CONTEXT_MESSAGES) {
+    const totalChars = openaiMessages.reduce((sum, m) => sum + messageContentLength(m.content), 0);
+    if (totalChars <= MAX_CONTEXT_CHARS) {
+      return openaiMessages;
+    }
+  }
+
+  // Keep assistant(tool_calls)+tool results as atomic units so truncation does
+  // not break tool-call/result chains.
+  const units: Array<{ indices: number[]; chars: number }> = [];
+  let pendingToolUnit: number[] | undefined;
+  for (let i = 0; i < openaiMessages.length; i++) {
+    const message = openaiMessages[i];
+    const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+
+    if (message.role === 'assistant' && hasToolCalls) {
+      if (pendingToolUnit && pendingToolUnit.length > 0) {
+        units.push({
+          indices: pendingToolUnit,
+          chars: pendingToolUnit.reduce((sum, idx) => sum + messageContentLength(openaiMessages[idx].content), 0),
+        });
+      }
+      pendingToolUnit = [i];
+      continue;
+    }
+
+    if (message.role === 'tool') {
+      if (pendingToolUnit) {
+        pendingToolUnit.push(i);
+      } else {
+        units.push({ indices: [i], chars: messageContentLength(message.content) });
+      }
+      continue;
+    }
+
+    if (pendingToolUnit && pendingToolUnit.length > 0) {
+      units.push({
+        indices: pendingToolUnit,
+        chars: pendingToolUnit.reduce((sum, idx) => sum + messageContentLength(openaiMessages[idx].content), 0),
+      });
+      pendingToolUnit = undefined;
+    }
+
+    units.push({ indices: [i], chars: messageContentLength(message.content) });
+  }
+  if (pendingToolUnit && pendingToolUnit.length > 0) {
+    units.push({
+      indices: pendingToolUnit,
+      chars: pendingToolUnit.reduce((sum, idx) => sum + messageContentLength(openaiMessages[idx].content), 0),
+    });
+  }
+
+  // Ensure at least the newest system message is retained for instruction continuity.
+  const latestSystemIndex = (() => {
+    for (let i = openaiMessages.length - 1; i >= 0; i--) {
+      if (openaiMessages[i].role === 'system') {
+        return i;
+      }
+    }
+    return -1;
+  })();
+
+  const selectedUnitIds = new Set<number>();
+  let selectedCount = 0;
+  let selectedChars = 0;
+
+  const includeUnit = (unitId: number, force = false): boolean => {
+    if (selectedUnitIds.has(unitId)) {
+      return true;
+    }
+
+    const unit = units[unitId];
+    const nextCount = selectedCount + unit.indices.length;
+    const nextChars = selectedChars + unit.chars;
+    if (!force && (nextCount > MAX_CONTEXT_MESSAGES || nextChars > MAX_CONTEXT_CHARS)) {
+      return false;
+    }
+
+    selectedUnitIds.add(unitId);
+    selectedCount = nextCount;
+    selectedChars = nextChars;
+    return true;
+  };
+
+  if (latestSystemIndex >= 0) {
+    const systemUnitId = units.findIndex((u) => u.indices.includes(latestSystemIndex));
+    if (systemUnitId >= 0) {
+      includeUnit(systemUnitId, true);
+    }
+  }
+
+  for (let unitId = units.length - 1; unitId >= 0; unitId--) {
+    includeUnit(unitId, false);
+  }
+
+  const selectedIndices = Array.from(selectedUnitIds)
+    .flatMap((unitId) => units[unitId].indices)
+    .sort((a, b) => a - b);
+
+  const truncated = selectedIndices.map((idx) => openaiMessages[idx]);
+
+  if (truncated.length === 0 && openaiMessages.length > 0) {
+    // Last-resort fallback: always send at least the newest message.
+    return [openaiMessages[openaiMessages.length - 1]];
+  }
+
+  const originalChars = openaiMessages.reduce((sum, m) => sum + messageContentLength(m.content), 0);
+  const truncatedChars = truncated.reduce((sum, m) => sum + messageContentLength(m.content), 0);
+
+  if (truncated.length < openaiMessages.length) {
+    logWarn(
+      `[Truncate] model=${modelId} messages=${openaiMessages.length} -> ${truncated.length} (dropped ${openaiMessages.length - truncated.length})`
+    );
+  }
+  if (truncatedChars < originalChars) {
+    logWarn(
+      `[Truncate] model=${modelId} totalChars=${originalChars} -> ${truncatedChars}`
+    );
+  }
+  if (latestSystemIndex >= 0 && !truncated.some((m) => m.role === 'system')) {
+    logWarn(`[Truncate] model=${modelId} no system message survived truncation`);
+  }
+
+  return truncated;
 }
 
 function extractSseEvents(
@@ -211,17 +360,28 @@ function parseToolArgumentsOrThrow(rawArgs: string | undefined, toolName: string
     parsed = JSON.parse(input);
   } catch {
     const preview = input.slice(0, 200);
-    throw new Error(`Malformed tool call arguments from ${source} for tool "${toolName}": ${preview}`);
+    logWarn(`Malformed tool call arguments from ${source} for tool "${toolName}"; using {}. preview=${preview}`);
+    return {};
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     const kind = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
-    throw new Error(
-      `Malformed tool call arguments from ${source} for tool "${toolName}": expected JSON object, got ${kind}`
+    logWarn(
+      `Malformed tool call arguments from ${source} for tool "${toolName}": expected JSON object, got ${kind}; using {}`
     );
+    return {};
   }
 
   return parsed as object;
+}
+
+function isServerGenerationError(message: string): boolean {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes('api error 500') ||
+    msg.includes('internal_error') ||
+    msg.includes('failed to generate response')
+  );
 }
 
 function emitNonStreamingCompletion(
@@ -263,12 +423,7 @@ function emitNonStreamingCompletion(
   if (reasoningText != null) {
     emittedPart = true;
     const text = String(reasoningText);
-    if (shouldShowThinking) {
-      const thinkingPart = new vscode.LanguageModelThinkingPart(text);
-      progress.report(thinkingPart as unknown as vscode.LanguageModelResponsePart);
-    } else {
-      progress.report(new vscode.LanguageModelTextPart(text));
-    }
+    progress.report(new vscode.LanguageModelTextPart(text));
   }
 
   if (message.content != null && message.content !== '') {
@@ -351,9 +506,7 @@ async function buildOpenAIMessages(messages: readonly vscode.LanguageModelChatRe
   // Find indices (relative to last10) of vision prompts (messages with image/* data parts)
   const visionIndices: number[] = [];
   last10.forEach((msg, idx) => {
-    const dataParts = msg.content.filter(
-      (p): p is vscode.LanguageModelDataPart => p instanceof vscode.LanguageModelDataPart
-    );
+    const dataParts = msg.content.filter(isDataPart);
     if (dataParts.some((p) => p.mimeType.startsWith('image/'))) {
       visionIndices.push(idx);
     }
@@ -482,8 +635,31 @@ async function buildOpenAIMessages(messages: readonly vscode.LanguageModelChatRe
       result.push({ role, content: part.value, name: msg.name });
     }
     for (const part of dataParts) {
-      logDebug(`[buildMessages]   non-image data: ${part.mimeType}`);
-      result.push({ role, content: `[${part.mimeType} data]`, name: msg.name });
+      // Decode text/* and application/json files dragged into the chat field.
+      const isDecodableText =
+        part.mimeType.startsWith('text/') ||
+        part.mimeType === 'application/json' ||
+        part.mimeType === 'application/xml';
+      if (isDecodableText) {
+        try {
+          const text =
+            typeof part.data === 'string'
+              ? part.data
+              : new TextDecoder('utf-8', { fatal: false }).decode(part.data as Uint8Array);
+          if (text.trim()) {
+            logDebug(`[buildMessages]   decoded data part mimeType=${part.mimeType} len=${text.length}`);
+            result.push({ role, content: text, name: msg.name });
+          } else {
+            logDebug(`[buildMessages]   decoded data part was empty: ${part.mimeType}`);
+          }
+        } catch {
+          logWarn(`[buildMessages]   failed to decode data part mimeType=${part.mimeType}`);
+          result.push({ role, content: `[${part.mimeType} data]`, name: msg.name });
+        }
+      } else {
+        logDebug(`[buildMessages]   non-decodable data: ${part.mimeType}`);
+        result.push({ role, content: `[${part.mimeType} data]`, name: msg.name });
+      }
     }
   }
 
@@ -542,6 +718,9 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
     const shouldShowThinking = modelSupportsThinking && selectedEffort !== 'none';
 
     const temperature = getModelTemperature(baseModelId);
+    let disableReasoningEffortForRequest = false;
+    let forceNonStreamingForRequest = false;
+    const hasTools = !!(options.tools && options.tools.length > 0);
 
     let retries = 0;
     let lastError: unknown;
@@ -564,6 +743,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
       const startMs = Date.now();
       let ttfMs: number | undefined;
       let emittedAnyPart = false;
+      let usedStreamOnAttempt = false;
 
       // Connection timeout: fires if no bytes arrive within CONNECTION_TIMEOUT_MS.
       // Idle timeout: fires if no new chunk arrives within IDLE_TIMEOUT_MS after streaming starts.
@@ -580,13 +760,15 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
       };
 
       try {
-        const openaiMessages = await buildOpenAIMessages(messages);
+        const builtMessages = await buildOpenAIMessages(messages);
+        const openaiMessages = truncateOpenAIMessages(builtMessages, baseModelId);
 
         // Detect vision requests (any message with array content = image_url format)
         const hasVisionContent = openaiMessages.some((m) => Array.isArray(m.content));
         // CrofAI vision API bug: system messages + stream=true returns 0 tokens.
         // Fall back to non-streaming for vision requests as a workaround.
-        const useStream = !hasVisionContent;
+        const useStream = !hasVisionContent && !forceNonStreamingForRequest;
+        usedStreamOnAttempt = useStream;
 
         const requestBody: Record<string, unknown> = {
           model: baseModelId,
@@ -595,7 +777,10 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
           max_tokens: getModelMaxOutputTokens(baseModelId),
         };
         if (temperature !== undefined) requestBody.temperature = temperature;
-        if (selectedEffort) requestBody.reasoning_effort = selectedEffort;
+        // Only send reasoning_effort for models that explicitly support reasoning.
+        if (modelSupportsThinking && selectedEffort && !disableReasoningEffortForRequest) {
+          requestBody.reasoning_effort = selectedEffort;
+        }
         if (options.tools && options.tools.length > 0) {
           requestBody.tools = options.tools.map((tool) => ({
             type: 'function',
@@ -694,12 +879,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
         const flushReasoning = () => {
           if (!reasoningBuffer) return;
           emittedAnyPart = true;
-          if (shouldShowThinking) {
-            const thinkingPart = new vscode.LanguageModelThinkingPart(reasoningBuffer);
-            progress.report(thinkingPart as unknown as vscode.LanguageModelResponsePart);
-          } else {
-            progress.report(new vscode.LanguageModelTextPart(reasoningBuffer));
-          }
+          progress.report(new vscode.LanguageModelTextPart(reasoningBuffer));
           reasoningBuffer = '';
         };
         let totalBytesReceived = 0;
@@ -904,6 +1084,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
         const errorMsg = error instanceof Error ? error.message : String(error);
         const errorStack = error instanceof Error ? error.stack : undefined;
         const isMalformedToolCallError = errorMsg.includes('Malformed tool call arguments');
+        const isEmptyStreamError = errorMsg.includes('Empty response stream from CrofAI');
         logError(`[Catch] model=${baseModelId} attempt=${retries}/${MAX_RETRIES} emittedAnyPart=${emittedAnyPart} error=${errorMsg} stack=${errorStack ?? '(no stack)'}`);
 
         if (isAbortError(error)) {
@@ -936,6 +1117,39 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
         // Malformed tool call arguments are payload issues and retries won't help.
         if (isMalformedToolCallError) {
           break;
+        }
+
+        // Empty streams are provider payload failures; retries waste request quota.
+        if (isEmptyStreamError) {
+          break;
+        }
+
+        if (
+          isServerGenerationError(errorMsg) &&
+          modelSupportsThinking &&
+          selectedEffort &&
+          !disableReasoningEffortForRequest
+        ) {
+          disableReasoningEffortForRequest = true;
+          retries++;
+          logWarn(
+            `[RetryMode] model=${baseModelId} disabling reasoning_effort after generation error: ${errorMsg}`
+          );
+          continue;
+        }
+
+        if (
+          isServerGenerationError(errorMsg) &&
+          usedStreamOnAttempt &&
+          !forceNonStreamingForRequest &&
+          !hasTools
+        ) {
+          forceNonStreamingForRequest = true;
+          retries++;
+          logWarn(
+            `[RetryMode] model=${baseModelId} forcing non-stream retry after streaming generation error: ${errorMsg}`
+          );
+          continue;
         }
 
         retries++;

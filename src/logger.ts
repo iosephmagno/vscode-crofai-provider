@@ -2,7 +2,7 @@
 import * as vscode from 'vscode';
 
 // Simple flag to enable/disable logging
-export let LOGGING_ENABLED = false;
+export let LOGGING_ENABLED = true;
 export function setLoggingEnabled(enabled: boolean) {
   LOGGING_ENABLED = enabled;
 }

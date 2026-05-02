@@ -5,17 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-bun install          # Install dependencies
-bun run compile      # Compile TypeScript → out/
-bun run watch        # Watch mode compilation
-bun run lint         # ESLint
-bun run format       # Prettier
-bun run package      # Build .vsix package
+npm install          # Install dependencies
+npm run compile      # Compile TypeScript → out/
+npm run watch        # Watch mode compilation
+npm run lint         # ESLint
+npm run format       # Prettier
+npm run package      # Build .vsix package
 ```
 
-No automated tests — `bun run test` requires a running VS Code instance via `vscode-test`.
+No automated tests — `npm run test` requires a running VS Code instance via `vscode-test`.
 
-To test manually: `bun run package`, then install `crof-ai-provider.vsix` via "Extensions: Install from VSIX".
+To test manually: `npm run package`, then install `crof-ai-provider.vsix` via "Extensions: Install from VSIX".
 
 ## Architecture
 
