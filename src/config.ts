@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { CrofAIModel, ReasoningEffort } from './types.js';
 import type { CrofAIModelsService } from './models.js';
+import { supportsReasoningEffort } from './models.js';
 
 export function getModelTemperature(modelId: string): number | undefined {
   const config = vscode.workspace.getConfiguration('crofai');
@@ -65,9 +66,7 @@ export async function showReasoningConfigUI(
       return;
     }
 
-    const reasoningModels = response.data.filter(
-      (m) => m.custom_reasoning === true || m.reasoning_effort === true
-    );
+    const reasoningModels = response.data.filter((m) => supportsReasoningEffort(m));
 
     if (reasoningModels.length === 0) {
       vscode.window.showInformationMessage('No reasoning models available.');

@@ -6,7 +6,13 @@ import { CrofAIUsageService, createUsageStatusBar } from './usage.js';
 import { getOutputChannel, disposeOutputChannel } from './logger.js';
 import { imageServer } from './imageServer.js';
 
+let activeProvider: CrofAIChatModelProvider | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
+  if (activeProvider) {
+    return;
+  }
+
   const ext = vscode.extensions.getExtension('CrofAI.crof-ai-provider');
   const extVersion = ext?.packageJSON?.version ?? 'unknown';
   const vscodeVersion = vscode.version;
@@ -14,9 +20,13 @@ export function activate(context: vscode.ExtensionContext) {
 
   const modelsService = new CrofAIModelsService(ua);
   const provider = new CrofAIChatModelProvider(context.secrets, ua, modelsService);
+  activeProvider = provider;
   const usageService = new CrofAIUsageService(ua);
 
   context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('crofai', provider));
+  // Force Copilot Chat to re-query model metadata instead of relying on cached entries.
+  // Use a single refresh path to avoid duplicate first-panel entries from rapid multi-fire events.
+  void provider.refreshModelPickerCache();
   context.subscriptions.push(provider);
   context.subscriptions.push({ dispose: disposeOutputChannel });
   getOutputChannel(); // initialize early so it appears in Output panel
@@ -47,7 +57,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.secrets.onDidChange((e) => {
       if (e.key === 'crofai.apiKey') {
         modelsService.invalidateCache();
-        provider.fireModelChange();
+        void provider.refreshModelPickerCache();
         updateStatus();
       }
     })
@@ -100,7 +110,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       // Refresh models and status bar immediately — don't wait for secrets.onDidChange
       modelsService.invalidateCache();
-      provider.fireModelChange();
+      await provider.refreshModelPickerCache();
       updateStatus();
     })
   );
@@ -120,12 +130,16 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('crofai.refreshModels', async () => {
       modelsService.invalidateCache();
-      provider.fireModelChange();
+      await provider.refreshModelPickerCache();
       vscode.window.showInformationMessage('CrofAI models refreshed.');
     })
   );
 }
 
-export function deactivate() {
+export async function deactivate() {
+  if (activeProvider) {
+    await activeProvider.prepareForDeactivate();
+    activeProvider = undefined;
+  }
   imageServer.dispose();
 }

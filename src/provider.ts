@@ -5,6 +5,7 @@ import {
   CrofAIModelsService,
   getModelMaxOutputTokens,
   getEffortFromModelId,
+  resolveModelVariant,
   reasoningModelIds,
 } from './models.js';
 import { getModelTemperature, getModelReasoningEffort } from './config.js';
@@ -669,6 +670,10 @@ async function buildOpenAIMessages(messages: readonly vscode.LanguageModelChatRe
 
 export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider<LanguageModelChatInformation> {
   private readonly _onDidChangeModelInfo = new vscode.EventEmitter<void>();
+  private _isActive = true;
+  private _modelInfoCache: LanguageModelChatInformation[] | undefined;
+  private _modelInfoCallCount = 0;
+  private _activeModelConfigKey: string | undefined;
   readonly onDidChangeLanguageModelChatInformation = this._onDidChangeModelInfo.event;
 
   constructor(
@@ -678,6 +683,22 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
   ) {}
 
   fireModelChange(): void {
+    this._modelInfoCache = undefined;
+    this._activeModelConfigKey = undefined;
+    this._onDidChangeModelInfo.fire();
+  }
+
+  async refreshModelPickerCache(): Promise<void> {
+    this._modelInfoCache = undefined;
+    this._activeModelConfigKey = undefined;
+    // Single event to avoid duplicate accumulation in the first picker panel.
+    this._onDidChangeModelInfo.fire();
+  }
+
+  async prepareForDeactivate(): Promise<void> {
+    this._isActive = false;
+    this._modelInfoCache = undefined;
+    this._activeModelConfigKey = undefined;
     this._onDidChangeModelInfo.fire();
   }
 
@@ -689,7 +710,51 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
     options: vscode.PrepareLanguageModelChatModelOptions,
     token: CancellationToken
   ): Promise<LanguageModelChatInformation[]> {
-    return this.modelsService.prepareLanguageModelChatInformation(this.secrets, options, token);
+    this._modelInfoCallCount += 1;
+    const configuration = (options as vscode.PrepareLanguageModelChatModelOptions & {
+      readonly configuration?: Record<string, unknown>;
+    }).configuration;
+    const configKey = JSON.stringify(configuration ?? {});
+    if (!this._isActive) {
+      logInfo(`[ModelInfo] call=${this._modelInfoCallCount} inactive -> 0 models`);
+      return [];
+    }
+
+    if (this._activeModelConfigKey === undefined) {
+      this._activeModelConfigKey = configKey;
+    } else if (this._activeModelConfigKey !== configKey) {
+      logInfo(
+        `[ModelInfo] call=${this._modelInfoCallCount} skipped alternate-config active=${this._activeModelConfigKey} current=${configKey}`
+      );
+      return [];
+    }
+
+    const describeModels = (models: readonly LanguageModelChatInformation[]): string =>
+      models.map((model) => `${model.id}|${model.name}|${model.family}`).join(',');
+
+    if (this._modelInfoCache) {
+      logInfo(
+        `[ModelInfo] call=${this._modelInfoCallCount} config=${configKey} cache-hit count=${this._modelInfoCache.length} models=${describeModels(this._modelInfoCache)}`
+      );
+      return this._modelInfoCache;
+    }
+
+    const infos = await this.modelsService.prepareLanguageModelChatInformation(this.secrets, options, token);
+    const seenIds = new Set<string>();
+    const uniqueInfos: LanguageModelChatInformation[] = [];
+    for (const info of infos) {
+      if (seenIds.has(info.id)) {
+        continue;
+      }
+      seenIds.add(info.id);
+      uniqueInfos.push(info);
+    }
+
+    this._modelInfoCache = uniqueInfos;
+    logInfo(
+      `[ModelInfo] call=${this._modelInfoCallCount} config=${configKey} built count=${uniqueInfos.length} models=${describeModels(uniqueInfos)}`
+    );
+    return uniqueInfos;
   }
 
   async provideLanguageModelChatResponse(
@@ -708,7 +773,17 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
 
     const { baseModelId, effort: suffixEffort } = getEffortFromModelId(model.id);
     // Priority: VS Code model config picker → old suffix → stored setting → model default
-    const configEffortRaw = options.modelConfiguration?.reasoningEffort;
+    const configEffortRaw =
+      options.modelConfiguration?.reasoningEffort ??
+      (options as vscode.ProvideLanguageModelChatResponseOptions & {
+        readonly configuration?: Record<string, unknown>;
+      }).configuration?.reasoningEffort;
+    const configVariantRaw =
+      options.modelConfiguration?.modelVariant ??
+      (options as vscode.ProvideLanguageModelChatResponseOptions & {
+        readonly configuration?: Record<string, unknown>;
+      }).configuration?.modelVariant;
+    const selectedApiModelId = resolveModelVariant(baseModelId, configVariantRaw);
     const configEffort =
       typeof configEffortRaw === 'string' && VALID_REASONING_EFFORTS.has(configEffortRaw)
         ? (configEffortRaw as ReasoningEffort)
@@ -771,10 +846,10 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
         usedStreamOnAttempt = useStream;
 
         const requestBody: Record<string, unknown> = {
-          model: baseModelId,
+          model: selectedApiModelId,
           messages: openaiMessages,
           stream: useStream,
-          max_tokens: getModelMaxOutputTokens(baseModelId),
+          max_tokens: getModelMaxOutputTokens(selectedApiModelId),
         };
         if (temperature !== undefined) requestBody.temperature = temperature;
         // Only send reasoning_effort for models that explicitly support reasoning.
@@ -801,7 +876,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
           return m.role;
         }).join(',');
         const visionTag = hasVisionContent ? ' [VISION]' : '';
-        logInfo(`[Request]${visionTag} model=${baseModelId} stream=${useStream} messages=${openaiMessages.length} totalChars=${totalMessageChars} roles=[${roleSequence}]`);
+        logInfo(`[Request]${visionTag} model=${baseModelId} apiModel=${selectedApiModelId} stream=${useStream} messages=${openaiMessages.length} totalChars=${totalMessageChars} roles=[${roleSequence}]`);
         logPayloadToFile('request', requestBody);
 
         const response = await fetch(`${BASE_URL}/chat/completions`, {
