@@ -9,7 +9,6 @@ export const UsageResponseSchema = z.object({
 export type UsageResponse = z.infer<typeof UsageResponseSchema>;
 
 const USAGE_API_URL = 'https://crof.ai/usage_api/';
-const STATUS_BAR_INTERVAL_MS = 5 * 60 * 1000;
 const FETCH_USAGE_TIMEOUT_MS = 15_000;
 
 export class CrofAIUsageService {
@@ -95,8 +94,6 @@ export function createUsageStatusBar(
   };
 
   updateStatus();
-  const interval = setInterval(updateStatus, STATUS_BAR_INTERVAL_MS);
-  context.subscriptions.push({ dispose: () => clearInterval(interval) });
 
   return { statusBarItem, updateStatus };
 }
