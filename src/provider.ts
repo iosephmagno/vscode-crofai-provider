@@ -842,13 +842,18 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
         const hasVisionContent = openaiMessages.some((m) => Array.isArray(m.content));
         // CrofAI vision API bug: system messages + stream=true returns 0 tokens.
         // Fall back to non-streaming for vision requests as a workaround.
-        const useStream = !hasVisionContent && !forceNonStreamingForRequest;
+        // Reasoning effort requests also use non-streaming because the CrofAI
+        // server counts each SSE streaming chunk as a separate API request,
+        // causing thousands of requests per chat when reasoning is active.
+        const isReasoningWithEffort = modelSupportsThinking && selectedEffort && selectedEffort !== 'none' && !disableReasoningEffortForRequest;
+        const useStream = !hasVisionContent && !forceNonStreamingForRequest && !isReasoningWithEffort;
         usedStreamOnAttempt = useStream;
 
         const requestBody: Record<string, unknown> = {
           model: selectedApiModelId,
           messages: openaiMessages,
           stream: useStream,
+          stream_options: { include_usage: true },
           max_tokens: getModelMaxOutputTokens(selectedApiModelId),
         };
         if (temperature !== undefined) requestBody.temperature = temperature;
@@ -886,7 +891,7 @@ export class CrofAIChatModelProvider implements vscode.LanguageModelChatProvider
             Authorization: `Bearer ${apiKey}`,
             'User-Agent': this.userAgent,
           },
-          body: JSON.stringify({ ...requestBody, messages: openaiMessages }),
+          body: JSON.stringify(requestBody),
           signal: abortController.signal,
         });
 
